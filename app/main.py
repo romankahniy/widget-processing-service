@@ -1,3 +1,5 @@
+import redis
+import hashlib
 from fastapi import FastAPI, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -13,6 +15,8 @@ app = FastAPI(
     description="Asynchronous widget processing with quantum simulation",
     version="1.0.0"
 )
+
+redis_client = redis.Redis(host='redis', port=6379, decode_responses=True)
 
 
 @app.on_event("startup")
@@ -31,22 +35,48 @@ async def create_widget(
     db: Session = Depends(get_db),
     user_id: str = Depends(rate_limiter.check_rate_limit)
 ):
-    db_widget = Widget(
-        name=widget.name,
-        complexity_score=widget.complexity_score,
-        status=WidgetStatus.PENDING
-    )
+    task_id = hashlib.sha256(f"{user_id}_{widget.name}_{widget.complexity_score}".encode()).hexdigest()
 
-    db.add(db_widget)
-    db.commit()
-    db.refresh(db_widget)
+    widget_exist = redis_client.get(f"submission:{task_id}")
+    if widget_exist:
+        return WidgetCreateResponse(widget_id=int(widget_exist), status="pending")
 
-    process_widget.delay(db_widget.id)
+    lock = redis_client.lock(f"lock:{task_id}", timeout=2)
+    try:
+        if not lock.acquire(blocking=True, blocking_timeout=1):
+            raise HTTPException(
+                status_code=503,
+                detail="Service temporarily unavailable, please retry"
+            )
 
-    return WidgetCreateResponse(
-        widget_id=db_widget.id,
-        status=db_widget.status.value
-    )
+        widget_exist = redis_client.get(f"submission:{task_id}")
+        if widget_exist:
+            return WidgetCreateResponse(widget_id=int(widget_exist), status="pending")
+
+        db_widget = Widget(
+            name=widget.name,
+            complexity_score=widget.complexity_score,
+            status=WidgetStatus.PENDING
+        )
+
+        db.add(db_widget)
+        db.commit()
+        db.refresh(db_widget)
+
+        redis_client.setex(f"submission:{task_id}", 60, db_widget.id)
+
+        process_widget.apply_async([db_widget.id], task_id=task_id)
+
+        return WidgetCreateResponse(
+            widget_id=db_widget.id,
+            status=db_widget.status.value
+        )
+
+    finally:
+        try:
+            lock.release()
+        except redis.exceptions.LockError:
+            pass
 
 
 @app.get(
